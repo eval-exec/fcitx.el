@@ -487,9 +487,6 @@
   (declare-function fcitx-read-key-sequence-vector-turn-on "fcitx")
   (declare-function fcitx-read-key-sequence-vector-turn-off "fcitx"))
 
-(defvar fcitx-prefix-keys-polling-time 0.1
-  "Time interval to execute prefix keys polling function.")
-
 (defcustom fcitx-use-dbus nil
   "Whether we should use D-Bus version (and which specific version) or not.
 Default value is nil."
@@ -504,8 +501,14 @@ Default value is nil."
 (defvar fcitx--prefix-keys-sequence nil
   "Prefix keys that can trigger disabling fcitx.")
 
-(defvar fcitx--prefix-keys-timer nil
-  "Timer for prefix keys polling function.")
+(defvar fcitx--prefix-keys-on-p nil
+  "Whether the prefix-keys feature is enabled.")
+
+(defvar fcitx--prefix-keys-installed nil
+  "Prefix keys that are installed into `input-decode-map'.")
+
+(defvar fcitx--prefix-keys-saved-bindings nil
+  "Saved original bindings of the installed prefix keys in `input-decode-map'.")
 
 (defvar fcitx--aggressive-p nil
   "Whether we should disable fcitx whenever we're in the minibuffer.")
@@ -641,44 +644,125 @@ Re-run the setup function after `fcitx' is started.")))
        (or (equal command 'switch-to-buffer)
            (equal command 'other-window))))
 
-(defun fcitx--prefix-keys-polling-function ()
-  "Polling function executed every `fcitx-prefix-keys-polling-time'."
-  (let ((key-seq (this-single-command-keys)))
-    (cond
-     ((member key-seq fcitx--prefix-keys-sequence)
-      (fcitx--prefix-keys-maybe-deactivate))
-     ((and (equal (this-command-keys-vector) [])
-           (not (fcitx--evil-adviced-commands-p last-command))
-           (not (and fcitx--aggressive-p
-                     (window-minibuffer-p)))
-           (not (and
-                 (boundp 'which-key--paging-functions)
-                 (member this-command which-key--paging-functions))))
-      (fcitx--prefix-keys-maybe-activate)))))
+(defvar fcitx--prefix-keys-idle-timer nil
+  "One-shot idle timer for the prefix-keys feature.
+
+Usually fcitx is re-activated by `post-command-hook' right after the
+command following the prefix key.  However, when a pending key
+sequence is aborted by a quit, no command runs at all.  This timer
+serves as a safety net for that case.  It is armed only when a prefix
+key actually disables fcitx and is gone after firing, so unlike the
+old polling timer it never runs periodically.")
+
+(defun fcitx--prefix-keys-arm-idle-timer ()
+  "Arm the one-shot idle timer that re-activates fcitx when idle."
+  (when fcitx--prefix-keys-idle-timer
+    (cancel-timer fcitx--prefix-keys-idle-timer))
+  (setq fcitx--prefix-keys-idle-timer
+        (run-with-idle-timer 1 nil
+                             #'fcitx--prefix-keys-idle-activate)))
+
+(defun fcitx--prefix-keys-idle-activate ()
+  (setq fcitx--prefix-keys-idle-timer nil)
+  (fcitx--prefix-keys-maybe-activate))
+
+(defun fcitx--prefix-keys-post-command-hook ()
+  "Re-activate fcitx after the current command is done.
+
+Fcitx is only deactivated by this feature while a prefix key is
+pending, so it can be re-activated as soon as any command has
+finished (unless another feature still wants it disabled)."
+  (when (and (not (fcitx--evil-adviced-commands-p this-command))
+             (not (and fcitx--aggressive-p
+                       (window-minibuffer-p)))
+             (not (and
+                   (boundp 'which-key--paging-functions)
+                   (member this-command which-key--paging-functions))))
+    (fcitx--prefix-keys-maybe-activate)))
+
+(defun fcitx--prefix-keys-covered-p (key)
+  "Return non-nil if KEY is covered by a shorter installed prefix key.
+
+In that case the shorter key's translation already disables fcitx
+before KEY can be completed, so KEY needs no translation of its own."
+  (let ((covered nil))
+    (dolist (installed fcitx--prefix-keys-installed covered)
+      (when (and (< (length installed) (length key))
+                 (equal installed (substring key 0 (length installed))))
+        (setq covered t)))))
+
+(defun fcitx--prefix-keys-install-key (key)
+  "Install KEY into `input-decode-map' to disable fcitx when KEY is pressed.
+
+The translation function returns KEY itself, so KEY still works as a
+prefix key afterwards.  Emacs applies such an identity translation
+only once, thus no infinite loop happens."
+  (unless (or (member key fcitx--prefix-keys-installed)
+              (fcitx--prefix-keys-covered-p key))
+    (let ((old-binding (lookup-key input-decode-map key)))
+      (push key fcitx--prefix-keys-installed)
+      (push (cons key old-binding) fcitx--prefix-keys-saved-bindings)
+      (condition-case nil
+          (define-key input-decode-map key
+            `(lambda (_prompt)
+               (fcitx--prefix-keys-maybe-deactivate)
+               (when fcitx--prefix-keys-disabled-by-elisp
+                 (fcitx--prefix-keys-arm-idle-timer))
+               ',key))
+        (error
+         ;; KEY cannot be installed, e.g. because it is nested under a
+         ;; non-prefix entry owned by something else.  Leave the map alone.
+         (setq fcitx--prefix-keys-installed
+               (delete key fcitx--prefix-keys-installed))
+         (setq fcitx--prefix-keys-saved-bindings
+               (delete (cons key old-binding)
+                       fcitx--prefix-keys-saved-bindings)))))))
+
+(defun fcitx--prefix-keys-shorter-p (a b)
+  (< (length (car a)) (length (car b))))
+
+(defun fcitx--prefix-keys-uninstall-keys ()
+  "Remove the installed prefix keys from `input-decode-map'."
+  ;; Restore shorter keys first: a nested key cannot be removed while
+  ;; its parent is still bound to our translation function.
+  (dolist (entry (sort (copy-sequence fcitx--prefix-keys-saved-bindings)
+                       #'fcitx--prefix-keys-shorter-p))
+    (let ((key (car entry)) (old (cdr entry)))
+      (unless (equal (lookup-key input-decode-map key) old)
+        (condition-case nil
+            (define-key input-decode-map key old)
+          (error nil)))))
+  (setq fcitx--prefix-keys-installed nil
+        fcitx--prefix-keys-saved-bindings nil))
 
 ;;;###autoload
 (defun fcitx-prefix-keys-add (&rest prefix-keys)
   (interactive)
   (dolist (key prefix-keys)
-    (add-to-list 'fcitx--prefix-keys-sequence
-                 (vconcat (read-kbd-macro key)))))
+    (setq key (vconcat (read-kbd-macro key)))
+    (add-to-list 'fcitx--prefix-keys-sequence key)
+    (when fcitx--prefix-keys-on-p
+      (fcitx--prefix-keys-install-key key))))
 
 ;;;###autoload
 (defun fcitx-prefix-keys-turn-on ()
-  "Turn on `fcixt-disable-prefix-keys'."
+  "Turn on the prefix-keys feature."
   (interactive)
-  (unless fcitx--prefix-keys-timer
-    (setq fcitx--prefix-keys-timer
-          (run-at-time t fcitx-prefix-keys-polling-time
-                       #'fcitx--prefix-keys-polling-function))))
+  (setq fcitx--prefix-keys-on-p t)
+  (add-hook 'post-command-hook #'fcitx--prefix-keys-post-command-hook)
+  (dolist (key fcitx--prefix-keys-sequence)
+    (fcitx--prefix-keys-install-key key)))
 
 ;;;###autoload
 (defun fcitx-prefix-keys-turn-off ()
-  "Turn off `fcixt-disable-prefix-keys'."
+  "Turn off the prefix-keys feature."
   (interactive)
-  (when fcitx--prefix-keys-timer
-    (cancel-timer fcitx--prefix-keys-timer)
-    (setq fcitx--prefix-keys-timer nil)))
+  (setq fcitx--prefix-keys-on-p nil)
+  (remove-hook 'post-command-hook #'fcitx--prefix-keys-post-command-hook)
+  (when fcitx--prefix-keys-idle-timer
+    (cancel-timer fcitx--prefix-keys-idle-timer)
+    (setq fcitx--prefix-keys-idle-timer nil))
+  (fcitx--prefix-keys-uninstall-keys))
 
 ;;;###autoload
 (defun fcitx-prefix-keys-setup ()
